@@ -6,12 +6,19 @@
 # MAGIC This notebook walks through the full lifecycle of a Lakebase Autoscaling instance using `lakebase-utils`:
 # MAGIC
 # MAGIC 1. Install and import
-# MAGIC 2. Configuration — provide your **project name**, **branch name**, and **database name**
-# MAGIC 3. Connect and discover the Lakebase instance
-# MAGIC 4. Database → Schema → Table CRUD
-# MAGIC 5. Rename objects
-# MAGIC 6. Error handling patterns
-# MAGIC 7. Clean up
+# MAGIC 2. Configuration — provide your **project name**, **branch name**, **database name**, and **grantee role**
+# MAGIC 3. Connect and discover the Lakebase project
+# MAGIC 4. Database operations
+# MAGIC 5. Schema operations + access control
+# MAGIC 6. Table operations + access control
+# MAGIC 7. Rename objects
+# MAGIC 8. Error handling patterns
+# MAGIC 9. Clean up
+# MAGIC
+# MAGIC ### Access control primer
+# MAGIC In PostgreSQL, permissions are **not inherited** from parent objects.
+# MAGIC To read a table a user needs three independent grants:
+# MAGIC `CONNECT` on the database → `USAGE` on the schema → `SELECT` on the table.
 
 # COMMAND ----------
 
@@ -27,14 +34,17 @@
 # MAGIC %md
 # MAGIC ## 1. Configuration
 # MAGIC
-# MAGIC Fill in the three required values below. Everything else is derived at runtime.
+# MAGIC Fill in all required values below. Everything else is derived at runtime.
 
 # COMMAND ----------
 
 # ── Required inputs ──────────────────────────────────────────────────────────
-PROJECT_NAME  = "my-project"      # Lakebase instance / project name
-BRANCH_NAME   = "main"            # Branch or environment label (used in comments / tags)
+PROJECT_NAME  = "my-project"      # Lakebase project name / ID
+BRANCH_NAME   = "main"            # Branch name
 DATABASE_NAME = "analytics"       # PostgreSQL database to create
+
+# Role or user to grant access to (e.g. a service principal name or Databricks user)
+GRANTEE_ROLE  = "analyst_role"
 
 # PostgreSQL endpoint — provided by your Databricks admin (read-only, cannot be created or updated via API)
 PG_HOST = ""                      # e.g. "lb-abc123.postgres.database.azure.com"
@@ -67,9 +77,9 @@ print("Client initialised.")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 3. Discover the Lakebase instance
+# MAGIC ## 3. Discover the Lakebase project
 # MAGIC
-# MAGIC `client.instance.get()` fetches read-only control-plane metadata (state, capacity, creator).
+# MAGIC `client.instance.get()` fetches read-only control-plane metadata (state, creator).
 # MAGIC The PostgreSQL endpoint cannot be created or updated via the API — it is provisioned by your
 # MAGIC Databricks admin and must be supplied as `PG_HOST` in the configuration cell above.
 
@@ -77,22 +87,42 @@ print("Client initialised.")
 
 instance = client.instance.get(PROJECT_NAME)
 
-print(f"Instance  : {instance.name}")
+print(f"Project   : {instance.name}  (id={instance.instance_id})")
 print(f"State     : {instance.state}")
-print(f"Capacity  : {instance.capacity_min} – {instance.capacity_max}")
 print(f"Creator   : {instance.creator}")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### List all instances in the workspace
+# MAGIC ### List all projects in the workspace
 
 # COMMAND ----------
 
 all_instances = client.instance.list()
-print(f"{len(all_instances)} instance(s) found:")
+print(f"{len(all_instances)} project(s) found:")
 for inst in all_instances:
     print(f"  {inst.name!r:40s}  state={inst.state}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### (Optional) Inspect branches and endpoints
+# MAGIC
+# MAGIC Branches and endpoints are read-only — they are provisioned by your Databricks admin.
+# MAGIC Use `list_endpoints` to confirm the `PG_HOST` you were given.
+
+# COMMAND ----------
+
+branches = client.instance.list_branches(PROJECT_NAME)
+print(f"Branches for '{PROJECT_NAME}':")
+for b in branches:
+    print(f"  {b['name']}")
+
+endpoints = client.instance.list_endpoints(PROJECT_NAME, BRANCH_NAME)
+print(f"\nEndpoints for branch '{BRANCH_NAME}':")
+for ep in endpoints:
+    s = ep.get("status", {})
+    print(f"  {ep['name']}  →  {s.get('host')}:{s.get('port')}")
 
 # COMMAND ----------
 
@@ -119,12 +149,6 @@ for d in databases:
 
 # COMMAND ----------
 
-# Fetch a single database by name
-db_info = client.databases.get(DATABASE_NAME)
-print(db_info)
-
-# COMMAND ----------
-
 # MAGIC %md
 # MAGIC ## 5. Schema operations
 
@@ -142,11 +166,93 @@ print(f"Schema    : {schema.database}.{schema.name}  owner={schema.owner}")
 
 # COMMAND ----------
 
-# List all schemas in the database (system schemas are excluded)
-schemas = client.schemas.list(database=DATABASE_NAME)
-print(f"{len(schemas)} schema(s) in '{DATABASE_NAME}':")
-for s in schemas:
-    print(f"  {s.name}")
+# MAGIC %md
+# MAGIC ### 5a. Check schema access
+# MAGIC
+# MAGIC Query `information_schema.role_usage_grants` to see who currently has `USAGE`
+# MAGIC on the schema.  An empty result means only the owner can see inside it.
+
+# COMMAND ----------
+
+with client.pg_connection(database=DATABASE_NAME) as conn:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT grantee, privilege_type, is_grantable
+            FROM information_schema.role_usage_grants
+            WHERE object_type = 'SCHEMA'
+              AND object_schema = %s
+            ORDER BY grantee
+            """,
+            (SCHEMA_NAME,),
+        )
+        rows = cur.fetchall()
+
+if rows:
+    print(f"Current USAGE grants on schema '{SCHEMA_NAME}':")
+    for grantee, priv, grantable in rows:
+        print(f"  {grantee:30s}  {priv}  (grantable={grantable})")
+else:
+    print(f"No USAGE grants found on schema '{SCHEMA_NAME}' — only the owner has access.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 5b. Grant schema access
+# MAGIC
+# MAGIC Two grants are needed before a user can touch any table in this schema:
+# MAGIC - `CONNECT` on the database (one-time, per database)
+# MAGIC - `USAGE` on the schema
+# MAGIC
+# MAGIC Note: `USAGE` lets a role see and interact with objects inside the schema.
+# MAGIC It does **not** grant read/write on individual tables — that comes in section 6b.
+
+# COMMAND ----------
+
+from psycopg2 import sql as pgsql
+
+# Grant CONNECT on the database
+with client.pg_connection() as conn:
+    with conn.cursor() as cur:
+        cur.execute(
+            pgsql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
+                pgsql.Identifier(DATABASE_NAME),
+                pgsql.Identifier(GRANTEE_ROLE),
+            )
+        )
+print(f"Granted CONNECT on database '{DATABASE_NAME}' to '{GRANTEE_ROLE}'.")
+
+# Grant USAGE on the schema
+with client.pg_connection(database=DATABASE_NAME) as conn:
+    with conn.cursor() as cur:
+        cur.execute(
+            pgsql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(
+                pgsql.Identifier(SCHEMA_NAME),
+                pgsql.Identifier(GRANTEE_ROLE),
+            )
+        )
+print(f"Granted USAGE on schema '{SCHEMA_NAME}' to '{GRANTEE_ROLE}'.")
+
+# COMMAND ----------
+
+# Verify the grant was applied
+with client.pg_connection(database=DATABASE_NAME) as conn:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT grantee, privilege_type
+            FROM information_schema.role_usage_grants
+            WHERE object_type = 'SCHEMA'
+              AND object_schema = %s
+            ORDER BY grantee
+            """,
+            (SCHEMA_NAME,),
+        )
+        rows = cur.fetchall()
+
+print(f"USAGE grants on schema '{SCHEMA_NAME}' after grant:")
+for grantee, priv in rows:
+    print(f"  {grantee:30s}  {priv}")
 
 # COMMAND ----------
 
@@ -177,11 +283,89 @@ print(f"Columns   : {[c.name for c in table.columns]}")
 
 # COMMAND ----------
 
-# List all tables in the schema
-tables = client.tables.list(schema=SCHEMA_NAME, database=DATABASE_NAME)
-print(f"{len(tables)} table(s) in '{DATABASE_NAME}.{SCHEMA_NAME}':")
-for t in tables:
-    print(f"  {t.name:30s}  cols={[c.name for c in t.columns]}")
+# MAGIC %md
+# MAGIC ### 6a. Check table access
+# MAGIC
+# MAGIC Query `information_schema.role_table_grants` to see existing privileges.
+# MAGIC A freshly created table has no grants other than to its owner.
+
+# COMMAND ----------
+
+with client.pg_connection(database=DATABASE_NAME) as conn:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT grantee, privilege_type, is_grantable
+            FROM information_schema.role_table_grants
+            WHERE table_schema = %s
+              AND table_name   = %s
+            ORDER BY grantee, privilege_type
+            """,
+            (SCHEMA_NAME, TABLE_NAME),
+        )
+        rows = cur.fetchall()
+
+if rows:
+    print(f"Current grants on table '{SCHEMA_NAME}.{TABLE_NAME}':")
+    for grantee, priv, grantable in rows:
+        print(f"  {grantee:30s}  {priv:20s}  (grantable={grantable})")
+else:
+    print(f"No grants found on '{SCHEMA_NAME}.{TABLE_NAME}' — only the owner has access.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 6b. Grant table access
+# MAGIC
+# MAGIC Grant the minimum required privileges.  Common patterns:
+# MAGIC
+# MAGIC | Use case | Privileges |
+# MAGIC |---|---|
+# MAGIC | Read-only analyst | `SELECT` |
+# MAGIC | ETL writer | `INSERT`, `UPDATE`, `DELETE` |
+# MAGIC | Full access | `ALL PRIVILEGES` |
+# MAGIC
+# MAGIC > **Reminder:** `USAGE` on the schema (section 5b) must already be in place,
+# MAGIC > otherwise the grantee cannot reach this table even with a table-level grant.
+
+# COMMAND ----------
+
+with client.pg_connection(database=DATABASE_NAME) as conn:
+    with conn.cursor() as cur:
+        cur.execute(
+            pgsql.SQL("GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {}.{} TO {}").format(
+                pgsql.Identifier(SCHEMA_NAME),
+                pgsql.Identifier(TABLE_NAME),
+                pgsql.Identifier(GRANTEE_ROLE),
+            )
+        )
+print(f"Granted SELECT/INSERT/UPDATE/DELETE on '{SCHEMA_NAME}.{TABLE_NAME}' to '{GRANTEE_ROLE}'.")
+
+# COMMAND ----------
+
+# Verify the grant was applied
+with client.pg_connection(database=DATABASE_NAME) as conn:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT grantee, privilege_type
+            FROM information_schema.role_table_grants
+            WHERE table_schema = %s
+              AND table_name   = %s
+            ORDER BY grantee, privilege_type
+            """,
+            (SCHEMA_NAME, TABLE_NAME),
+        )
+        rows = cur.fetchall()
+
+print(f"Grants on '{SCHEMA_NAME}.{TABLE_NAME}' after grant:")
+for grantee, priv in rows:
+    print(f"  {grantee:30s}  {priv}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 6c. Column operations
 
 # COMMAND ----------
 

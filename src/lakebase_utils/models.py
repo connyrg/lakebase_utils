@@ -18,10 +18,10 @@ class InstanceInfo:
     instance_id: str
     name: str
     state: str
-    """Lifecycle state reported by Databricks (e.g. 'RUNNING', 'STOPPED')."""
-    pg_host: str
-    """PostgreSQL-compatible endpoint hostname."""
-    pg_port: int
+    """Lifecycle state reported by Databricks (e.g. 'READY', 'STOPPED')."""
+    pg_host: Optional[str] = None
+    """PostgreSQL-compatible endpoint hostname (available at the endpoint level)."""
+    pg_port: int = 5432
     """PostgreSQL-compatible endpoint port (default 5432)."""
     capacity_min: Optional[int] = None
     """Minimum autoscaling capacity (DBUs or connection units)."""

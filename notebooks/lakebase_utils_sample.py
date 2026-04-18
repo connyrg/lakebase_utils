@@ -119,13 +119,13 @@ for inst in all_instances:
 branches = client.instance.list_branches(PROJECT_NAME)
 print(f"Branches for '{PROJECT_NAME}':")
 for b in branches:
-    print(f"  {b['name']}")
+    print(f"  {b.name}")
 
 endpoints = client.instance.list_endpoints(PROJECT_NAME, BRANCH_NAME)
 print(f"\nEndpoints for branch '{BRANCH_NAME}':")
 for ep in endpoints:
-    s = ep.get("status", {})
-    print(f"  {ep['name']}  →  {s.get('host')}:{s.get('port')}")
+    host = ep.status.hosts.host if ep.status and ep.status.hosts else "unknown"
+    print(f"  {ep.name}  →  {host}")
 
 # COMMAND ----------
 

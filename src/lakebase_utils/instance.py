@@ -1,15 +1,13 @@
 """Read-only operations for Lakebase Autoscaling instances (control plane).
 
-All methods use the Databricks SDK WorkspaceClient and do not modify
-any instance or project configuration — the platform team owns that.
-
-API base path: /api/2.0/postgres/
-Resource hierarchy: projects/{project_id}/branches/{branch_id}/endpoints/{endpoint_id}
+All methods use the Databricks SDK ``WorkspaceClient.postgres`` service.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
+
+from databricks.sdk.service.postgres import Branch, Endpoint, Project
 
 from .exceptions import LakebaseNotFoundError, LakebaseOperationError
 from .models import InstanceInfo
@@ -29,7 +27,7 @@ class InstanceManager:
         info = client.instance.get("my-project")
         print(info.state, info.creator)
 
-        instances = client.instance.list()
+        projects = client.instance.list()
     """
 
     def __init__(self, client: "LakebaseClient") -> None:
@@ -40,28 +38,26 @@ class InstanceManager:
     # ------------------------------------------------------------------
 
     def get(self, instance_name: str) -> InstanceInfo:
-        """Return metadata for a single Lakebase project by name/ID.
+        """Return metadata for a single Lakebase project by ID.
 
         Parameters
         ----------
         instance_name:
             The project ID (e.g. ``"datascience-foundation-stream"``).
+            Internally resolved to the resource name ``projects/{instance_name}``.
 
         Returns
         -------
         InstanceInfo
-            Metadata including state and creator.
 
         Raises
         ------
         LakebaseNotFoundError
-            If no project with that ID exists in the workspace.
         LakebaseOperationError
-            If the Databricks API call fails for any other reason.
         """
         try:
-            raw = self._client._ws.api_client.do(
-                "GET", f"/api/2.0/postgres/projects/{instance_name}"
+            project = self._client._ws.postgres.get_project(
+                name=f"projects/{instance_name}"
             )
         except Exception as exc:
             msg = str(exc).upper()
@@ -72,49 +68,43 @@ class InstanceManager:
             raise LakebaseOperationError(
                 f"Failed to fetch project {instance_name!r}: {exc}"
             ) from exc
-        return self._to_instance_info(raw)
+        return self._to_instance_info(project)
 
     def list(self) -> list[InstanceInfo]:
         """Return metadata for all Lakebase projects visible in the workspace.
 
-        Returns
-        -------
-        list[InstanceInfo]
-            May be empty if no projects exist or the caller has no access.
-
         Raises
         ------
         LakebaseOperationError
-            If the Databricks API call fails.
         """
         try:
-            resp = self._client._ws.api_client.do("GET", "/api/2.0/postgres/projects")
+            projects = list(self._client._ws.postgres.list_projects())
         except Exception as exc:
             raise LakebaseOperationError(f"Failed to list projects: {exc}") from exc
-        return [self._to_instance_info(r) for r in resp.get("projects", [])]
+        return [self._to_instance_info(p) for p in projects]
 
-    def list_branches(self, project_id: str) -> list[dict]:
+    def list_branches(self, project_id: str) -> list[Branch]:
         """Return all branches for a project.
 
         Parameters
         ----------
         project_id:
-            The project ID.
+            The project ID. Resolved to ``projects/{project_id}``.
         """
         try:
-            resp = self._client._ws.api_client.do(
-                "GET", f"/api/2.0/postgres/projects/{project_id}/branches"
-            )
+            return list(self._client._ws.postgres.list_branches(
+                parent=f"projects/{project_id}"
+            ))
         except Exception as exc:
             raise LakebaseOperationError(
                 f"Failed to list branches for project {project_id!r}: {exc}"
             ) from exc
-        return resp.get("branches", [])
 
-    def list_endpoints(self, project_id: str, branch_id: str) -> list[dict]:
+    def list_endpoints(self, project_id: str, branch_id: str) -> list[Endpoint]:
         """Return all endpoints for a project branch.
 
-        Each endpoint has ``status.host`` and ``status.port`` for connecting.
+        Each endpoint's ``status.hosts.host`` is the PostgreSQL hostname,
+        and ``status.current_state`` shows whether it is ACTIVE or IDLE.
 
         Parameters
         ----------
@@ -124,42 +114,33 @@ class InstanceManager:
             The branch ID (e.g. ``"main"``).
         """
         try:
-            resp = self._client._ws.api_client.do(
-                "GET",
-                f"/api/2.0/postgres/projects/{project_id}/branches/{branch_id}/endpoints",
-            )
+            return list(self._client._ws.postgres.list_endpoints(
+                parent=f"projects/{project_id}/branches/{branch_id}"
+            ))
         except Exception as exc:
             raise LakebaseOperationError(
                 f"Failed to list endpoints for {project_id!r}/{branch_id!r}: {exc}"
             ) from exc
-        return resp.get("endpoints", [])
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _to_instance_info(self, raw: object) -> InstanceInfo:
-        """Convert a raw Databricks API response to :class:`InstanceInfo`.
-
-        Response shape (GET /api/2.0/postgres/projects/{project_id})::
-
-            {
-              "name": "projects/{project_id}",
-              "status": {
-                "display_name": "...",
-                "state": "READY",
-                "creator": "user@example.com",
-                "pg_version": 17
-              }
-            }
-        """
-        status = raw.get("status") or {}
-        full_name = raw.get("name", "")
+    def _to_instance_info(self, project: Project) -> InstanceInfo:
+        """Convert a :class:`~databricks.sdk.service.postgres.Project` to :class:`InstanceInfo`."""
+        status = project.status
+        full_name = project.name or ""
         # "projects/{project_id}" → project_id
         project_id = full_name.split("/")[-1] if "/" in full_name else full_name
+
+        tags: dict[str, str] = {}
+        if status and status.custom_tags:
+            tags = {t.key: t.value for t in status.custom_tags if t.key}
+
         return InstanceInfo(
             instance_id=project_id,
-            name=status.get("display_name") or project_id,
-            state=status.get("state", "UNKNOWN"),
-            creator=status.get("creator"),
+            name=(status.display_name if status else None) or project_id,
+            state="UNKNOWN",  # state lives at endpoint level, not project level
+            creator=status.owner if status else None,
+            tags=tags,
         )

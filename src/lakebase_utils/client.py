@@ -15,7 +15,8 @@ Usage::
     client = LakebaseClient(
         host="https://<workspace>.azuredatabricks.net",
         token="dapi...",
-        pg_host="<lakebase-pg-endpoint>",
+        pg_host="<hostname>",
+        pg_endpoint="projects/<project-id>/branches/<branch-id>/endpoints/<endpoint-id>",
     )
 
     # Service Principal (explicit)
@@ -23,11 +24,15 @@ Usage::
         host="https://<workspace>.azuredatabricks.net",
         client_id="<sp-client-id>",
         client_secret="<sp-client-secret>",
-        pg_host="<lakebase-pg-endpoint>",
+        pg_host="<hostname>",
+        pg_endpoint="projects/<project-id>/branches/<branch-id>/endpoints/<endpoint-id>",
     )
 
     # From environment variables only
-    client = LakebaseClient(pg_host="<lakebase-pg-endpoint>")
+    client = LakebaseClient(
+        pg_host="<hostname>",
+        pg_endpoint="projects/<project-id>/branches/<branch-id>/endpoints/<endpoint-id>",
+    )
 
     # Use sub-managers
     info = client.instance.get("my-lakebase-instance")
@@ -80,6 +85,11 @@ class LakebaseClient:
         Can also be set later via :meth:`set_pg_endpoint`.
     pg_port:
         PostgreSQL endpoint port. Defaults to 5432.
+    pg_endpoint:
+        Full Lakebase endpoint resource name used for OAuth credential generation.
+        Format: ``projects/{project-id}/branches/{branch-id}/endpoints/{endpoint-id}``.
+        Required for data-plane operations.
+        Can also be set later via :meth:`set_pg_endpoint`.
     """
 
     def __init__(
@@ -90,6 +100,7 @@ class LakebaseClient:
         client_secret: Optional[str] = None,
         pg_host: Optional[str] = None,
         pg_port: int = 5432,
+        pg_endpoint: Optional[str] = None,
     ) -> None:
         resolved_host = host or os.environ.get("DATABRICKS_HOST")
         resolved_token = token or os.environ.get("DATABRICKS_TOKEN")
@@ -119,6 +130,7 @@ class LakebaseClient:
 
         self._pg_host = pg_host
         self._pg_port = pg_port
+        self._pg_endpoint = pg_endpoint
 
         # Lazy-initialised sub-managers (populated on first access)
         self._instance_manager: Optional[_InstanceManagerAccessor] = None
@@ -166,16 +178,19 @@ class LakebaseClient:
     # PostgreSQL connection helpers
     # ------------------------------------------------------------------
 
-    def set_pg_endpoint(self, host: str, port: int = 5432) -> None:
+    def set_pg_endpoint(self, host: str, port: int = 5432, endpoint: Optional[str] = None) -> None:
         """Set (or update) the PostgreSQL endpoint for data-plane operations."""
         self._pg_host = host
         self._pg_port = port
+        if endpoint is not None:
+            self._pg_endpoint = endpoint
 
     def _generate_pg_credentials(self) -> tuple[str, str]:
         """Generate short-lived OAuth credentials for the Lakebase PostgreSQL endpoint.
 
-        Calls the Databricks ``generate-database-credentials`` API, which returns
-        a short-lived token.  The token is used as the PostgreSQL password.
+        Uses the Databricks SDK ``WorkspaceClient.postgres.generate_database_credential``
+        which returns a :class:`~databricks.sdk.service.postgres.DatabaseCredential`
+        with a short-lived ``token`` field used as the PostgreSQL password.
 
         Returns
         -------
@@ -185,19 +200,22 @@ class LakebaseClient:
         Raises
         ------
         LakebaseAuthError
-            If the credential generation API call fails.
+            If the credential generation call fails.
         """
+        if not self._pg_endpoint:
+            raise LakebaseAuthError(
+                "pg_endpoint is required for credential generation. "
+                "Pass pg_endpoint= to LakebaseClient or call set_pg_endpoint() first."
+            )
         try:
-            resp = self._ws.api_client.do(
-                "POST", "/api/2.0/postgres/generate-database-credentials"
+            credential = self._ws.postgres.generate_database_credential(
+                endpoint=self._pg_endpoint
             )
         except Exception as exc:
             raise LakebaseAuthError(
                 f"Failed to generate database credentials: {exc}"
             ) from exc
-        pg_user = resp.get("user", "oauth2")
-        pg_password = resp.get("token") or resp.get("access_token", "")
-        return pg_user, pg_password
+        return "oauth2", credential.token
 
     @contextmanager
     def pg_connection(

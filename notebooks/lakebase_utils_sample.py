@@ -46,9 +46,11 @@ DATABASE_NAME = "analytics"       # PostgreSQL database to create
 # Role or user to grant access to (e.g. a service principal name or Databricks user)
 GRANTEE_ROLE  = "analyst_role"
 
-# PostgreSQL endpoint — provided by your Databricks admin (read-only, cannot be created or updated via API)
-PG_HOST = ""                      # e.g. "lb-abc123.postgres.database.azure.com"
-PG_PORT = 5432
+# PostgreSQL connection details — provided by your Databricks admin (read-only, cannot be created or updated via API)
+PG_HOST     = ""    # e.g. "lb-abc123.postgres.database.azure.com"
+PG_PORT     = 5432
+PG_ENDPOINT = ""    # e.g. "projects/my-project/branches/main/endpoints/primary"
+                    # Used by the SDK to generate a short-lived OAuth token (pg_password)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Auth — prefer environment variables (DATABRICKS_HOST / DATABRICKS_TOKEN)
@@ -70,6 +72,7 @@ client = LakebaseClient(
     token=DATABRICKS_TOKEN or None,
     pg_host=PG_HOST,
     pg_port=PG_PORT,
+    pg_endpoint=PG_ENDPOINT,
 )
 
 print("Client initialised.")

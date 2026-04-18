@@ -5,20 +5,29 @@ Authentication resolution order (mirrors databricks-sdk defaults):
   2. Environment variables: ``DATABRICKS_HOST``, ``DATABRICKS_TOKEN``,
      ``DATABRICKS_CLIENT_ID``, ``DATABRICKS_CLIENT_SECRET``.
 
+PostgreSQL credentials are **not** static — they are generated on every
+connection via the Databricks ``generate-database-credentials`` API, which
+returns a short-lived token used as the PostgreSQL password.
+
 Usage::
 
     # PAT token (explicit)
-    client = LakebaseClient(host="https://<workspace>.azuredatabricks.net", token="dapi...")
+    client = LakebaseClient(
+        host="https://<workspace>.azuredatabricks.net",
+        token="dapi...",
+        pg_host="<lakebase-pg-endpoint>",
+    )
 
     # Service Principal (explicit)
     client = LakebaseClient(
         host="https://<workspace>.azuredatabricks.net",
         client_id="<sp-client-id>",
         client_secret="<sp-client-secret>",
+        pg_host="<lakebase-pg-endpoint>",
     )
 
     # From environment variables only
-    client = LakebaseClient()
+    client = LakebaseClient(pg_host="<lakebase-pg-endpoint>")
 
     # Use sub-managers
     info = client.instance.get("my-lakebase-instance")
@@ -45,8 +54,10 @@ class LakebaseClient:
 
     Owns two connections:
     - ``_ws``: :class:`databricks.sdk.WorkspaceClient` for control-plane calls
-      (instance metadata, listing instances).
+      (instance metadata, listing instances, generating database credentials).
     - PostgreSQL connection factory for data-plane DDL (databases, schemas, tables).
+      Credentials are generated fresh on every :meth:`pg_connection` call via
+      the Databricks ``generate-database-credentials`` API.
 
     Parameters
     ----------
@@ -65,15 +76,10 @@ class LakebaseClient:
     pg_host:
         PostgreSQL endpoint hostname for the Lakebase instance.
         Required for data-plane operations (databases / schemas / tables).
-        Can be retrieved from :meth:`instance.get` and set later via
-        :meth:`set_pg_endpoint`.
+        Provided by your Databricks admin — cannot be created or updated via API.
+        Can also be set later via :meth:`set_pg_endpoint`.
     pg_port:
         PostgreSQL endpoint port. Defaults to 5432.
-    pg_user:
-        PostgreSQL username. Defaults to ``token`` (Lakebase accepts the
-        Databricks token as the password for the ``token`` user).
-    pg_password:
-        PostgreSQL password. Defaults to the resolved Databricks token.
     """
 
     def __init__(
@@ -84,8 +90,6 @@ class LakebaseClient:
         client_secret: Optional[str] = None,
         pg_host: Optional[str] = None,
         pg_port: int = 5432,
-        pg_user: Optional[str] = None,
-        pg_password: Optional[str] = None,
     ) -> None:
         resolved_host = host or os.environ.get("DATABRICKS_HOST")
         resolved_token = token or os.environ.get("DATABRICKS_TOKEN")
@@ -107,18 +111,14 @@ class LakebaseClient:
                     client_secret=resolved_client_secret,
                 )
             else:
-                # Let databricks-sdk attempt its own credential chain
                 cfg = Config(host=resolved_host)
 
             self._ws = WorkspaceClient(config=cfg)
         except Exception as exc:
             raise LakebaseAuthError(f"Failed to initialise Databricks client: {exc}") from exc
 
-        # PostgreSQL data-plane settings
         self._pg_host = pg_host
         self._pg_port = pg_port
-        self._pg_user = pg_user or "token"
-        self._pg_password = pg_password or resolved_token
 
         # Lazy-initialised sub-managers (populated on first access)
         self._instance_manager: Optional[_InstanceManagerAccessor] = None
@@ -167,12 +167,37 @@ class LakebaseClient:
     # ------------------------------------------------------------------
 
     def set_pg_endpoint(self, host: str, port: int = 5432) -> None:
-        """Set (or update) the PostgreSQL endpoint for data-plane operations.
-
-        Call this after resolving the endpoint from :meth:`instance.get`.
-        """
+        """Set (or update) the PostgreSQL endpoint for data-plane operations."""
         self._pg_host = host
         self._pg_port = port
+
+    def _generate_pg_credentials(self) -> tuple[str, str]:
+        """Generate short-lived OAuth credentials for the Lakebase PostgreSQL endpoint.
+
+        Calls the Databricks ``generate-database-credentials`` API, which returns
+        a short-lived token.  The token is used as the PostgreSQL password.
+
+        Returns
+        -------
+        tuple[str, str]
+            ``(pg_user, pg_password)`` where ``pg_password`` is the generated token.
+
+        Raises
+        ------
+        LakebaseAuthError
+            If the credential generation API call fails.
+        """
+        try:
+            resp = self._ws.api_client.do(
+                "POST", "/api/2.0/postgres/generate-database-credentials"
+            )
+        except Exception as exc:
+            raise LakebaseAuthError(
+                f"Failed to generate database credentials: {exc}"
+            ) from exc
+        pg_user = resp.get("user", "oauth2")
+        pg_password = resp.get("token") or resp.get("access_token", "")
+        return pg_user, pg_password
 
     @contextmanager
     def pg_connection(
@@ -180,27 +205,32 @@ class LakebaseClient:
     ) -> Generator[psycopg2.extensions.connection, None, None]:
         """Yield a psycopg2 connection to *database* on the Lakebase instance.
 
-        The connection is closed when the context manager exits.
+        Credentials are generated fresh on every call via
+        :meth:`_generate_pg_credentials` — the returned token is short-lived
+        and must not be cached across connections.
 
         Parameters
         ----------
         database:
             PostgreSQL database to connect to. Defaults to ``postgres``
-            (used for DDL operations that cannot run inside a user database,
-            such as ``CREATE DATABASE``).
+            (used for DDL that cannot run inside a user database, e.g.
+            ``CREATE DATABASE``).
         """
         if not self._pg_host:
             raise LakebaseConnectionError(
                 "PostgreSQL endpoint is not configured. "
                 "Pass pg_host= to LakebaseClient or call set_pg_endpoint() first."
             )
+
+        pg_user, pg_password = self._generate_pg_credentials()
+
         try:
             conn = psycopg2.connect(
                 host=self._pg_host,
                 port=self._pg_port,
                 dbname=database,
-                user=self._pg_user,
-                password=self._pg_password,
+                user=pg_user,
+                password=pg_password,
                 connect_timeout=10,
             )
             conn.autocommit = True
@@ -217,7 +247,6 @@ class LakebaseClient:
 
 # ---------------------------------------------------------------------------
 # Type stubs used only for IDE type-checking of sub-manager properties
-# (runtime types are the actual manager classes imported lazily above)
 # ---------------------------------------------------------------------------
 
 class _InstanceManagerAccessor:  # pragma: no cover

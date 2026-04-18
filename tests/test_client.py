@@ -1,7 +1,8 @@
 """Tests for LakebaseClient auth and initialisation."""
 
 import pytest
-from unittest.mock import patch, MagicMock
+import psycopg2
+from unittest.mock import patch, MagicMock, call
 
 from lakebase_utils import LakebaseClient, LakebaseAuthError, LakebaseConnectionError
 
@@ -36,6 +37,59 @@ class TestLakebaseClientInit:
         client = LakebaseClient()
         assert client is not None
 
+    def test_no_static_pg_credentials_stored(self, mock_ws_client):
+        client = LakebaseClient(host="https://host.azuredatabricks.net", token="dapi123")
+        assert not hasattr(client, "_pg_user")
+        assert not hasattr(client, "_pg_password")
+
+
+class TestGeneratePgCredentials:
+    def test_returns_user_and_token(self, mock_ws_client):
+        client = LakebaseClient(
+            host="https://host.azuredatabricks.net", token="dapi123", pg_host="pg.example.com"
+        )
+        client._ws.api_client.do.return_value = {"user": "oauth2", "token": "short-lived-tok"}
+        user, password = client._generate_pg_credentials()
+        assert user == "oauth2"
+        assert password == "short-lived-tok"
+
+    def test_calls_correct_endpoint(self, mock_ws_client):
+        client = LakebaseClient(
+            host="https://host.azuredatabricks.net", token="dapi123", pg_host="pg.example.com"
+        )
+        client._ws.api_client.do.return_value = {"user": "oauth2", "token": "tok"}
+        client._generate_pg_credentials()
+        client._ws.api_client.do.assert_called_once_with(
+            "POST", "/api/2.0/postgres/generate-database-credentials"
+        )
+
+    def test_raises_auth_error_on_failure(self, mock_ws_client):
+        client = LakebaseClient(
+            host="https://host.azuredatabricks.net", token="dapi123", pg_host="pg.example.com"
+        )
+        client._ws.api_client.do.side_effect = Exception("403 Forbidden")
+        with pytest.raises(LakebaseAuthError, match="generate database credentials"):
+            client._generate_pg_credentials()
+
+    def test_fresh_credentials_per_connection(self, mock_ws_client):
+        """Each pg_connection() call generates new credentials — never cached."""
+        client = LakebaseClient(
+            host="https://host.azuredatabricks.net", token="dapi123", pg_host="pg.example.com"
+        )
+        client._ws.api_client.do.return_value = {"user": "oauth2", "token": "tok"}
+
+        with patch("psycopg2.connect") as mock_connect:
+            mock_connect.return_value.__enter__ = MagicMock(return_value=MagicMock())
+            mock_connect.return_value.autocommit = True
+
+            with client.pg_connection():
+                pass
+            with client.pg_connection():
+                pass
+
+        # generate-database-credentials called once per pg_connection() call
+        assert client._ws.api_client.do.call_count == 2
+
 
 class TestPgConnection:
     def test_raises_when_pg_host_not_set(self, mock_ws_client):
@@ -49,6 +103,26 @@ class TestPgConnection:
         client.set_pg_endpoint("pg.lakebase.example.com", port=5432)
         assert client._pg_host == "pg.lakebase.example.com"
         assert client._pg_port == 5432
+
+    def test_uses_generated_credentials(self, mock_ws_client):
+        client = LakebaseClient(
+            host="https://host.azuredatabricks.net", token="dapi123", pg_host="pg.example.com"
+        )
+        client._ws.api_client.do.return_value = {"user": "oauth2", "token": "db-token-xyz"}
+
+        with patch("psycopg2.connect") as mock_connect:
+            mock_connect.return_value.autocommit = True
+            with client.pg_connection(database="analytics"):
+                pass
+
+        mock_connect.assert_called_once_with(
+            host="pg.example.com",
+            port=5432,
+            dbname="analytics",
+            user="oauth2",
+            password="db-token-xyz",
+            connect_timeout=10,
+        )
 
 
 class TestSubManagerAccess:

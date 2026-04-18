@@ -35,6 +35,10 @@
 PROJECT_NAME  = "my-project"      # Lakebase instance / project name
 BRANCH_NAME   = "main"            # Branch or environment label (used in comments / tags)
 DATABASE_NAME = "analytics"       # PostgreSQL database to create
+
+# PostgreSQL endpoint — provided by your Databricks admin (read-only, cannot be created or updated via API)
+PG_HOST = ""                      # e.g. "lb-abc123.postgres.database.azure.com"
+PG_PORT = 5432
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Auth — prefer environment variables (DATABRICKS_HOST / DATABRICKS_TOKEN)
@@ -54,7 +58,8 @@ from lakebase_utils import LakebaseClient
 client = LakebaseClient(
     host=DATABRICKS_HOST or None,
     token=DATABRICKS_TOKEN or None,
-    # pg_host is wired in after instance.get() below
+    pg_host=PG_HOST,
+    pg_port=PG_PORT,
 )
 
 print("Client initialised.")
@@ -64,8 +69,9 @@ print("Client initialised.")
 # MAGIC %md
 # MAGIC ## 3. Discover the Lakebase instance
 # MAGIC
-# MAGIC `client.instance.get()` fetches control-plane metadata — including the PostgreSQL
-# MAGIC endpoint — and we wire it back into the client so data-plane calls work.
+# MAGIC `client.instance.get()` fetches read-only control-plane metadata (state, capacity, creator).
+# MAGIC The PostgreSQL endpoint cannot be created or updated via the API — it is provisioned by your
+# MAGIC Databricks admin and must be supplied as `PG_HOST` in the configuration cell above.
 
 # COMMAND ----------
 
@@ -73,12 +79,8 @@ instance = client.instance.get(PROJECT_NAME)
 
 print(f"Instance  : {instance.name}")
 print(f"State     : {instance.state}")
-print(f"PG host   : {instance.pg_host}:{instance.pg_port}")
 print(f"Capacity  : {instance.capacity_min} – {instance.capacity_max}")
 print(f"Creator   : {instance.creator}")
-
-# Wire the PostgreSQL endpoint into the client
-client.set_pg_endpoint(instance.pg_host, instance.pg_port)
 
 # COMMAND ----------
 

@@ -56,7 +56,20 @@ class InstanceManager:
         LakebaseOperationError
             If the Databricks SDK call fails for any other reason.
         """
-        raise NotImplementedError
+        try:
+            raw = self._client._ws.api_client.do(
+                "GET", f"/api/2.0/lakebase/instances/{instance_name}"
+            )
+        except Exception as exc:
+            msg = str(exc).upper()
+            if any(k in msg for k in ("NOT_FOUND", "404", "RESOURCE_DOES_NOT_EXIST", "DOES_NOT_EXIST")):
+                raise LakebaseNotFoundError(
+                    f"Lakebase instance {instance_name!r} not found."
+                ) from exc
+            raise LakebaseOperationError(
+                f"Failed to fetch instance {instance_name!r}: {exc}"
+            ) from exc
+        return self._to_instance_info(raw)
 
     def list(self) -> list[InstanceInfo]:
         """Return metadata for all Lakebase instances visible in the workspace.
@@ -71,18 +84,28 @@ class InstanceManager:
         LakebaseOperationError
             If the Databricks SDK call fails.
         """
-        raise NotImplementedError
+        try:
+            resp = self._client._ws.api_client.do("GET", "/api/2.0/lakebase/instances")
+        except Exception as exc:
+            raise LakebaseOperationError(f"Failed to list instances: {exc}") from exc
+        return [self._to_instance_info(r) for r in resp.get("instances", [])]
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
     def _to_instance_info(self, raw: object) -> InstanceInfo:
-        """Convert a raw Databricks SDK response object to :class:`InstanceInfo`.
-
-        Parameters
-        ----------
-        raw:
-            The SDK response object returned by the lakebase API.
-        """
-        raise NotImplementedError
+        """Convert a raw Databricks SDK response object to :class:`InstanceInfo`."""
+        endpoint = raw.get("endpoint") or {}
+        capacity = raw.get("capacity") or {}
+        return InstanceInfo(
+            instance_id=raw.get("instance_id") or raw.get("id", ""),
+            name=raw.get("name", ""),
+            state=raw.get("state", "UNKNOWN"),
+            pg_host=endpoint.get("host", ""),
+            pg_port=int(endpoint.get("port", 5432)),
+            capacity_min=capacity.get("min"),
+            capacity_max=capacity.get("max"),
+            creator=raw.get("creator_user_name") or raw.get("creator"),
+            tags=raw.get("custom_tags") or {},
+        )
